@@ -1,0 +1,34 @@
+# --- WEB FRAMEWORK ---
+fastapi
+uvicorn[standard]
+pydantic
+email-validator
+
+# --- DATABASE ---
+sqlalchemy
+
+# --- AUTHENTICATION & SECURITY ---
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+
+# --- HTTP CLIENTS & NETWORKING ---
+httpx
+requests
+dnspython
+python-whois
+
+# --- AI & MACHINE LEARNING ---
+tensorflow
+scikit-learn
+numpy
+joblib
+
+# --- PDF GENERATION ---
+reportlab
+
+# --- EMAIL ---
+fastapi-mail
+
+# --- CONFIGURATION ---
+python-dotenv
