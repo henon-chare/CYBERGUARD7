@@ -1407,14 +1407,27 @@ async def start_monitoring(request: StartRequest, background_tasks: BackgroundTa
     return {"message": f"Monitoring Started", "targets": state.targets}
 
 @app.post("/stop")
-async def stop_monitoring(current_user: User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
+def stop(background_tasks: BackgroundTasks, current_user: User = Depends(auth.get_current_user)):
+    # Stop the monitoring loop flag
     state.is_monitoring = False
-    for t in state.targets: state.current_statuses[t] = "Stopped"
-    db_monitor = db.query(Monitor).filter(Monitor.user_id == current_user.id, Monitor.target_url == state.target_url).first()
-    if db_monitor:
-        db_monitor.is_active = False
-        db.commit()
-    return {"message": "Stopped"}
+
+    # --- FIX: Clear the persistent server-side data ---
+    # This ensures that when the user logs back in or refreshes, /status returns empty data.
+    state.targets = []
+    state.passive_targets = []
+    state.current_statuses = {}
+    state.histories = {}
+    state.timestamps = {}
+    state.baseline_avgs = {}
+    state.detectors = {}
+    state.lstm_detectors = {}
+    state.ml_detectors = {}
+    state.http_status_codes = {}
+    state.target_url = ""
+    # --------------------------------------------------
+
+    return {"message": "Monitoring stopped and data cleared"}
+
 
 # ================= STATUS ENDPOINT (DUAL KEY FIX) =================
 @app.get("/status")

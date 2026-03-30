@@ -778,7 +778,8 @@ const AlertDashboardComponent = ({ onBack, token }) => {
         </aside>
     );
 
-      const renderRuleConfigView = () => {
+    // --- View 1: Configuration ---
+    const renderRuleConfigView = () => {
         const getTargetName = (rule) => {
             if (rule.target_url) return rule.target_url;
             if (rule.target_id) {
@@ -819,66 +820,34 @@ const AlertDashboardComponent = ({ onBack, token }) => {
 
                 <div className="alert-config-layout">
                     <div className="config-creation-zone">
-                        <div className="section-header-with-line">
-                            <h4>Create New Protocol</h4>
-                        </div>
-                        
+                        <h4>Create New Protocol</h4>
                         <div className="protocol-cards-grid">
-                            {/* Uptime Monitor Card */}
                             <div className="protocol-card-pro" onClick={() => handleOpenCreateRule('service')}>
                                 <div className="card-glow blue"></div>
-                                <div className="card-background-effect"></div>
                                 <div className="card-content">
-                                    <div className="icon-box blue">
-                                        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                            <path d="M4 11a9 9 0 0 1 9 9"></path>
-                                            <path d="M4 4a16 16 0 0 1 16 16"></path>
-                                            <circle cx="5" cy="19" r="1"></circle>
-                                        </svg>
-                                    </div>
+                                    <div className="icon-box blue">📡</div>
                                     <h5>Uptime Monitor</h5>
                                     <p>Track latency and heartbeat failures.</p>
                                 </div>
                                 <div className="action-arrow">→</div>
                             </div>
-
-                            {/* Asset Tracking Card */}
                             <div className="protocol-card-pro" onClick={() => handleOpenCreateRule('domain')}>
                                 <div className="card-glow green"></div>
-                                <div className="card-background-effect"></div>
                                 <div className="card-content">
-                                    <div className="icon-box green">
-                                        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                            <circle cx="12" cy="12" r="10"></circle>
-                                            <line x1="2" y1="12" x2="22" y2="12"></line>
-                                            <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
-                                        </svg>
-                                    </div>
+                                    <div className="icon-box green">🌐</div>
                                     <h5>Asset Tracking</h5>
                                     <p>Track expiration and domain risk.</p>
                                 </div>
                                 <div className="action-arrow">→</div>
                             </div>
-
-                            {/* Threat Detection Card (Locked) */}
                             <div className="protocol-card-pro disabled">
                                 <div className="card-glow orange"></div>
-                                <div className="card-background-effect"></div>
                                 <div className="card-content">
-                                    <div className="icon-box orange">
-                                        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
-                                        </svg>
-                                    </div>
+                                    <div className="icon-box orange">🛡️</div>
                                     <h5>Threat Detection</h5>
                                     <p>WAF & Intrusion Signatures (Locked)</p>
                                 </div>
-                                <div className="lock-icon">
-                                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
-                                        <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
-                                    </svg>
-                                </div>
+                                <div className="lock-icon">🔒</div>
                             </div>
                         </div>
                     </div>
@@ -2364,10 +2333,23 @@ const DomainTrackingComponent = ({ onBack, token, username }) => {
 
 // ================= MONITORING COMPONENT =================
 const MonitoringComponent = ({ onBack, token, username }) => {
-  const [url, setUrl] = useState("");
+  // LocalStorage Keys
+  const STORAGE_KEY_DATA = 'cyberguard_monitor_data';
+  const STORAGE_KEY_URL = 'cyberguard_monitor_url';
+  const STORAGE_KEY_STATE = 'cyberguard_monitor_state';
+
+  // Initialize state from localStorage if available
+  const [url, setUrl] = useState(() => {
+    return localStorage.getItem(STORAGE_KEY_URL) || "";
+  });
+  
   const [lastStartedUrl, setLastStartedUrl] = useState("");
   
-  const [isMonitoring, setIsMonitoring] = useState(false);
+  const [isMonitoring, setIsMonitoring] = useState(() => {
+    const stored = localStorage.getItem(STORAGE_KEY_STATE);
+    return stored ? JSON.parse(stored) : false;
+  });
+
   const [isLoading, setIsLoading] = useState(false);
   const [activeTab, setActiveTab] = useState("monitoring");
   const [searchTerm, setSearchTerm] = useState("");
@@ -2381,14 +2363,36 @@ const MonitoringComponent = ({ onBack, token, username }) => {
   const [showSuccessModal, setShowSuccessModal] = useState(false);
   const [newlyAddedUrl, setNewlyAddedUrl] = useState("");
 
-  const [data, setData] = useState({
-    targets: [],
-    current_latencies: {},
-    baseline_avgs: {},
-    status_messages: {},
-    histories: {},
-    timestamps: {},
+  // Load data from localStorage on mount
+  const [data, setData] = useState(() => {
+    try {
+      const storedData = localStorage.getItem(STORAGE_KEY_DATA);
+      return storedData ? JSON.parse(storedData) : {
+        targets: [],
+        current_latencies: {},
+        baseline_avgs: {},
+        status_messages: {},
+        histories: {},
+        timestamps: {},
+      };
+    } catch (e) {
+      return {
+        targets: [],
+        current_latencies: {},
+        baseline_avgs: {},
+        status_messages: {},
+        histories: {},
+        timestamps: {},
+      };
+    }
   });
+
+  // Persist data to localStorage whenever it changes
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY_DATA, JSON.stringify(data));
+    localStorage.setItem(STORAGE_KEY_URL, url);
+    localStorage.setItem(STORAGE_KEY_STATE, JSON.stringify(isMonitoring));
+  }, [data, url, isMonitoring]);
 
   const isTargetDown = (status, latency) => {
     if (!status) return false;
@@ -2409,13 +2413,17 @@ const MonitoringComponent = ({ onBack, token, username }) => {
                   headers: { 'Authorization': `Bearer ${token}` }
               });
               if (response.ok) {
-                  const data = await response.json();
-                  setIsMonitoring(data.is_monitoring);
-                  setData(data); 
-                  if (data.is_monitoring) {
-                      const activeUrl = data.target_url || (data.targets.length > 0 ? data.targets[0] : "");
-                      setUrl(activeUrl);
-                      setLastStartedUrl(activeUrl);
+                  const backendData = await response.json();
+                  
+                  // Only overwrite local state if backend has active targets or we are actively monitoring
+                  if (backendData.is_monitoring || (backendData.targets && backendData.targets.length > 0)) {
+                      setIsMonitoring(backendData.is_monitoring);
+                      setData(backendData); 
+                      if (backendData.is_monitoring) {
+                          const activeUrl = backendData.target_url || (backendData.targets.length > 0 ? backendData.targets[0] : "");
+                          setUrl(activeUrl);
+                          setLastStartedUrl(activeUrl);
+                      }
                   }
               }
           } catch (error) {
@@ -2550,7 +2558,12 @@ const MonitoringComponent = ({ onBack, token, username }) => {
     }
   };
 
-  const handleClear = () => {
+  // --- MODIFIED: Clear Logic to remove localStorage ---
+  const handleClear = async () => {
+    // 1. Call the backend to stop the monitoring loop
+    await handleStop(); 
+
+    // 2. Clear the local state
     setData({
       targets: [],
       current_latencies: {},
@@ -2562,6 +2575,11 @@ const MonitoringComponent = ({ onBack, token, username }) => {
     setIsMonitoring(false);
     setSelectedMonitor(null);
     setLastStartedUrl(""); 
+    
+    // 3. Clear Persistence
+    localStorage.removeItem(STORAGE_KEY_DATA);
+    localStorage.removeItem(STORAGE_KEY_URL);
+    localStorage.removeItem(STORAGE_KEY_STATE);
   };
 
   const getFilteredTargets = () => {
@@ -3334,18 +3352,24 @@ const ToastContainer = () => {
     password: "",
     token: "",
   });
-  const [confirmPassword, setConfirmPassword] = useState("");
-  const [showPassword, setShowPassword] = useState(false);
+ // ... existing code ...
   const [message, setMessage] = useState("");
   const [userLoggedIn, setUserLoggedIn] = useState(false);
+  const [confirmPassword, setConfirmPassword] = useState(""); 
+
   const [authToken, setAuthToken] = useState(null); 
   const [selectedCard, setSelectedCard] = useState(null);
-  
-  // NEW STATE FOR FORGOT PASSWORD BUTTON DISABLE LOGIC
   const [isSubmitting, setIsSubmitting] = useState(false);
-
   const [isProfileOpen, setIsProfileOpen] = useState(false);
+  
+  // --- EXISTING STATE ---
+  const [showPassword, setShowPassword] = useState(false);
+  
+  // --- NEW STATE: Independent visibility for Confirm Password ---
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+
   const profileRef = useRef(null);
+// ... existing code ...
 
   useEffect(() => {
     const handleClickOutside = (event) => {
@@ -3452,6 +3476,21 @@ const ToastContainer = () => {
     }
   };
 
+  // --- NEW LOGOUT HANDLER ---
+  const handleLogout = () => {
+     setUserLoggedIn(false); 
+     setShowLanding(true);
+     setAuthToken(null);
+     localStorage.removeItem('auth_token');
+     
+     // Clear Monitoring Data on Logout
+     localStorage.removeItem('cyberguard_monitor_data');
+     localStorage.removeItem('cyberguard_monitor_url');
+     localStorage.removeItem('cyberguard_monitor_state');
+     
+     setIsProfileOpen(false);
+  };
+
   const HomePage = () => {
     if (selectedCard === "monitoring") {
       return <MonitoringComponent onBack={() => setSelectedCard(null)} token={authToken} username={formData.username} />;
@@ -3505,13 +3544,8 @@ const ToastContainer = () => {
                         </div>
                     </div>
                     <div className="profile-divider"></div>
-                    <button className="profile-logout-btn" onClick={() => { 
-                        setUserLoggedIn(false); 
-                        setShowLanding(true);
-                        setAuthToken(null);
-                        localStorage.removeItem('auth_token');
-                        setIsProfileOpen(false);
-                    }}>
+                    {/* UPDATED: Use handleLogout */}
+                    <button className="profile-logout-btn" onClick={handleLogout}>
                         Logout
                     </button>
                 </div>
@@ -3591,6 +3625,7 @@ const ToastContainer = () => {
               autoComplete="off" 
             />
           )}
+                    {/* ... Password Field (Leave this one as is) ... */}
           {(page === "login" || page === "register" || page === "reset") && (
             <div className="password-wrapper">
               <input 
@@ -3605,10 +3640,13 @@ const ToastContainer = () => {
               <span className="eye-icon" onClick={() => setShowPassword(!showPassword)} role="button" tabIndex="0">{showPassword ? "🔐" : "🔓"}</span>
             </div>
           )}
+
+          {/* ... Confirm Password Field (Updated below) ... */}
           {(page === "register" || page === "reset") && (
             <div className="password-wrapper">
               <input 
-                type={showPassword ? "text" : "password"} 
+                // CHANGED: Use showConfirmPassword here
+                type={showConfirmPassword ? "text" : "password"} 
                 name="confirmPassword" 
                 placeholder="Confirm Password" 
                 value={confirmPassword} 
@@ -3616,7 +3654,10 @@ const ToastContainer = () => {
                 required 
                 autoComplete="new-password" 
               />
-              <span className="eye-icon" onClick={() => setShowPassword(!showPassword)} role="button" tabIndex="0">{showPassword ? "🔐" : "🔓"}</span>
+              {/* CHANGED: Toggle showConfirmPassword here */}
+              <span className="eye-icon" onClick={() => setShowConfirmPassword(!showConfirmPassword)} role="button" tabIndex="0">
+                {showConfirmPassword ? "🔐" : "🔓"}
+              </span>
             </div>
           )}
           {page === "reset" && (
