@@ -1,5 +1,7 @@
 # models.py
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, ForeignKey, Float, LargeBinary # ADDED LargeBinary
+
+# FIX: Added UniqueConstraint to the imports
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, ForeignKey, Float, LargeBinary, UniqueConstraint
 from sqlalchemy.orm import relationship
 from database import Base
 from datetime import datetime
@@ -88,15 +90,23 @@ class MonitorLog(Base):
     monitor = relationship("Monitor", back_populates="logs")
 
 
+# models.py - Update the Incident class
+
 class Incident(Base):
     __tablename__ = "incidents"
     id = Column(Integer, primary_key=True, index=True)
-    monitor_id = Column(Integer, ForeignKey("monitors.id"), nullable=False)
+    
+    # CHANGED: nullable=False → nullable=True
+    monitor_id = Column(Integer, ForeignKey("monitors.id"), nullable=True)
+    
+    domain = Column(String(255), nullable=True, index=True)
     status = Column(String(50), default="Ongoing")
-    error_type =Column( String(100), nullable=True)
+    error_type = Column(String(100), nullable=True)
     started_at = Column(DateTime, default=datetime.utcnow, index=True)
     ended_at = Column(DateTime, nullable=True)
     duration_seconds = Column(Integer, nullable=True)
+    
+    # CHANGED: Remove back_populates or make it optional
     monitor = relationship("Monitor", back_populates="incidents")
 
 # ================= NEW ALERT MODEL =================
@@ -143,8 +153,15 @@ class AlertHistory(Base):
 class MonitorModelState(Base):
     __tablename__ = "monitor_model_states"
 
+    # FIX: Added composite unique constraint so one URL can have multiple model types
+    __table_args__ = (
+        UniqueConstraint('target_url', 'model_type', name='_url_model_type_uc'),
+    )
+
     id = Column(Integer, primary_key=True, index=True)
-    target_url = Column(String(500), unique=True, index=True, nullable=False)
+    
+    # FIX: Removed unique=True from this line (it was blocking IsolationForest and LSTM from saving)
+    target_url = Column(String(500), index=True, nullable=False)
     
     # Type of model being stored (e.g., 'smart_detector', 'isolation_forest')
     model_type = Column(String(50), nullable=False)

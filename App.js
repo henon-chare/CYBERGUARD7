@@ -2377,13 +2377,13 @@ const MonitoringComponent = ({ onBack, token, username }) => {
       };
     } catch (e) {
       return {
-        targets: [],
-        current_latencies: {},
-        baseline_avgs: {},
-        status_messages: {},
-        histories: {},
-        timestamps: {},
-      };
+    targets: [],
+    current_latencies: {},
+    baseline_avgs: {},
+    current_statuses: {},
+    histories: {},
+    timestamps: {},
+};
     }
   });
 
@@ -2394,15 +2394,18 @@ const MonitoringComponent = ({ onBack, token, username }) => {
     localStorage.setItem(STORAGE_KEY_STATE, JSON.stringify(isMonitoring));
   }, [data, url, isMonitoring]);
 
-  const isTargetDown = (status, latency) => {
+     const isTargetDown = (status, latency) => {
     if (!status) return false;
+    const upperStatus = status.toUpperCase();
     const backendDown = 
-           status.includes("CRITICAL") || 
-           status.includes("ERROR") || 
-           status.includes("SERVER DOWN") ||
-           status.includes("CONNECTION REFUSED") ||
-           status.includes("NOT FOUND (404)") || 
-           status.includes("TIMEOUT");           
+           upperStatus.includes("CRITICAL") || 
+           upperStatus.includes("ERROR") || 
+           upperStatus.includes("SERVER DOWN") ||
+           upperStatus.includes("CONNECTION REFUSED") ||
+           upperStatus.includes("NOT FOUND") || 
+           upperStatus.includes("TIMEOUT") ||
+           upperStatus.includes("UNREACHABLE") ||
+           latency === 0;           
     return backendDown;
   };
 
@@ -2628,7 +2631,7 @@ const MonitoringComponent = ({ onBack, token, username }) => {
 
   const MonitorDetailView = ({ target }) => {
       const history = data.histories[target] || [];
-      const status = data.status_messages[target] || "Idle";
+      const status = data.current_statuses[target] || "Idle";
       
       const SLOW_THRESHOLD = 2000;
       const validHistory = history.filter(h => h > 0);
@@ -2641,14 +2644,24 @@ const MonitoringComponent = ({ onBack, token, username }) => {
       const min = validHistory.length ? Math.min(...validHistory).toFixed(0) : 0;
       const max = validHistory.length ? Math.max(...validHistory).toFixed(0) : 0;
       
-      const is404 = status.includes("NOT FOUND");
-      const down = isTargetDown(status, history[history.length - 1]);
-      const isSlow = status.includes("WARNING") || (history.length > 0 && history[history.length-1] > 2000);
-      const lastCheck = new Date().toLocaleTimeString();
+          const is404 = status.includes("NOT FOUND");
+          const down = isTargetDown(status, history[history.length - 1]);
+          const isSlow = !down && (status.includes("WARNING") || (history.length > 0 && history[history.length-1] > 2000));
+          const lastCheck = new Date().toLocaleTimeString();
 
-      return (
-          <div className="monitor-detail-container fade-in-content">
-              <button onClick={() => setSelectedMonitor(null)} className="back-btn" style={{marginBottom: "20px"}}>
+          const getDetailStatusLabel = () => {
+            if (is404) return "404 Not Found";
+            if (!down) return isSlow ? "SLOW RESPONSE" : "UP";
+            const upperStatus = status.toUpperCase();
+            if (upperStatus.includes("TIMEOUT")) return "TIMEOUT";
+            if (upperStatus.includes("CRITICAL") || upperStatus.includes("PATTERN")) return "CRITICAL";
+            if (upperStatus.includes("REFUSED")) return "UNREACHABLE";
+            return "DOWN";
+          };
+
+          return (
+              <div className="monitor-detail-container fade-in-content">
+                  <button onClick={() => setSelectedMonitor(null)} className="back-btn" style={{marginBottom: "20px"}}>
                   ← Back to Dashboard
               </button>
 
@@ -2658,7 +2671,7 @@ const MonitoringComponent = ({ onBack, token, username }) => {
                           <h1 style={{fontSize: "2rem", margin: "0 0 10px 0"}}>{target.replace(/^https?:\/\//, '')}</h1>
                           <div style={{display: "flex", alignItems: "center", gap: "20px"}}>
                               <div style={{fontSize: "2rem", fontWeight: "bold", color: down ? (is404 ? "var(--status-red)" : "var(--status-red)") : (isSlow ? "var(--status-orange)" : "var(--status-green)")}}>
-                                  {is404 ? "404 Not Found" : (down ? "DOWN" : (isSlow ? "SLOW RESPONSE" : "UP"))}
+                                  {getDetailStatusLabel()}
                               </div>
                               <div style={{color: "var(--text-muted)", fontSize: "0.9rem"}}>
                                   HTTP/S monitor for {target}
@@ -2810,11 +2823,20 @@ const MonitoringComponent = ({ onBack, token, username }) => {
                   statusColorClass = "status-red";
                   statusBadgeColor = "var(--status-red)";
                   statusBgColor = "rgba(239, 68, 68, 0.15)";
-              } else if (down) {
-                  statusLabel = status.includes("TIMEOUT") ? "TIMEOUT" : (status.includes("CRITICAL") ? "CRITICAL" : "DOWN");
-                  statusColorClass = "status-red";
-                  statusBadgeColor = "var(--status-red)";
-                  statusBgColor = "rgba(239, 68, 68, 0.15)";
+             } else if (down) {
+              const upperStatus = status.toUpperCase();
+              if (upperStatus.includes("TIMEOUT")) {
+                statusLabel = "TIMEOUT";
+              } else if (upperStatus.includes("CRITICAL") || upperStatus.includes("PATTERN")) {
+                statusLabel = "CRITICAL";
+              } else if (upperStatus.includes("REFUSED")) {
+                statusLabel = "UNREACHABLE";
+              } else {
+                statusLabel = "DOWN";
+              }
+              statusColorClass = "status-red";
+              statusBadgeColor = "var(--status-red)";
+              statusBgColor = "rgba(239, 68, 68, 0.15)";
               } else {
                   if (isSlow) {
                       statusLabel = "SLOW RESPONSE";
@@ -3072,9 +3094,9 @@ const MonitoringComponent = ({ onBack, token, username }) => {
                   let down = 0;
                   let up = 0;
                   data.targets.forEach(t => {
-                      if(isTargetDown(data.status_messages[t], data.current_latencies[t])) down++;
-                      else up++;
-                  });
+    if(isTargetDown(data.current_statuses[t], data.current_latencies[t])) down++;
+    else up++;
+});
                   return (
                       <>
                           <div className="status-item">
@@ -3107,7 +3129,7 @@ const MonitoringComponent = ({ onBack, token, username }) => {
             </div>
             <div className="stat-row">
               <span className="lbl">Without incid.</span>
-              <span className="val">{data.targets.length - data.targets.filter(t => isTargetDown(data.status_messages[t], data.current_latencies[t])).length}</span>
+              <span className="val">{data.targets.filter(t => isTargetDown(data.current_statuses[t], data.current_latencies[t])).length}</span>
             </div>
             <div className="stat-row">
               <span className="lbl">Affected mon.</span>
@@ -3276,7 +3298,7 @@ const LandingPage = ({ onLogin, onRegister }) => {
           <div className="team-card">
             <div className="avatar">HC</div>
             <div className="dev-name">Henon Chare</div>
-            <div className="dev-role">Lead Developer</div>
+           
             <a href="mailto:henonchare21@gmail.com" className="contact-link email-link">📧 henonchare21@gmail.com</a>
             <a href="tel:+251982049520" className="contact-link phone-link">📞 +251 98 204 9520</a>
             <a href="https://github.com/henon-chare" target="_blank" rel="noopener noreferrer" className="contact-link github-link">💻 henon-chare</a>
@@ -3284,7 +3306,7 @@ const LandingPage = ({ onLogin, onRegister }) => {
           <div className="team-card">
             <div className="avatar">BT</div>
             <div className="dev-name">Biniyam Temesgen</div>
-            <div className="dev-role">Backend Engineer</div>
+            
             <a href="mailto:biniyamtemesgen40@gmail.com" className="contact-link email-link">📧 biniyamtemesgen40@gmail.com</a>
             <a href="tel:+251985957185" className="contact-link phone-link">📞 +251 98 595 7185</a>
             <a href="https://github.com/Bi-ni-yam" target="_blank" rel="noopener noreferrer" className="contact-link github-link">💻 Bi-ni-yam</a>
@@ -3292,7 +3314,7 @@ const LandingPage = ({ onLogin, onRegister }) => {
           <div className="team-card">
             <div className="avatar">MK</div>
             <div className="dev-name">Mikiyas Kindie</div>
-            <div className="dev-role">Frontend Specialist</div>
+            
             <a href="mailto:mikiyaskindie6@gmail.com" className="contact-link email-link">📧 mikiyaskindie6@gmail.com</a>
             <a href="tel:+251948010770" className="contact-link phone-link">📞 +251 94 801 0770</a>
             <a href="https://github.com/mikii122129" target="_blank" rel="noopener noreferrer" className="contact-link github-link">💻 mikii122129</a>
@@ -3300,7 +3322,7 @@ const LandingPage = ({ onLogin, onRegister }) => {
           <div className="team-card">
             <div className="avatar">AM</div>
             <div className="dev-name">Abinet Melkamu</div>
-            <div className="dev-role">System Architect</div>
+           
             <a href="mailto:instaman2124@gmail.com" className="contact-link email-link">📧 instaman2124@gmail.com</a>
             <a href="tel:+251923248825" className="contact-link phone-link">📞 +251 92 324 8825</a>
             <a href="https://github.com/abinetbdu" target="_blank" rel="noopener noreferrer" className="contact-link github-link">💻 abinetbdu</a>

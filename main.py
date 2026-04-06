@@ -4,6 +4,7 @@ import shlex
 import sys
 import json
 import socket
+import concurrent.futures
 import ssl  # Native SSL library
 import re
 import asyncio
@@ -1349,48 +1350,216 @@ async def download_global_domain_report(data: GlobalReportRequest, current_user:
         raise HTTPException(status_code=500, detail=str(e))
 
 # ================= HYBRID SUBDOMAIN DISCOVERY =================
-SAFE_SUBDOMAIN_LIST = ['www', 'mail', 'ftp', 'webmail', 'smtp', 'pop', 'ns1', 'ns2', 'imap', 'admin', 'api', 'dev', 'staging', 'test', 'beta', 'portal', 'shop', 'secure', 'vpn', 'remote', 'blog', 'forum', 'cdn', 'static', 'media', 'assets', 'img', 'images', 'video', 'app', 'apps', 'mobile', 'm', 'store', 'support', 'help', 'wiki', 'docs', 'status', 'panel', 'cpanel', 'webdisk', 'autodiscover', 'autoconfig', 'owa', 'exchange', 'email', 'relay', 'mx', 'mx1', 'mx2', 'news', 'tv', 'radio', 'chat', 'sip', 'proxy', 'gateway', 'monitor', 'jenkins', 'git', 'gitlab', 'svn']
+COMMON_SUBDOMAIN_LIST = [
+    'www', 'mail', 'ftp', 'webmail', 'smtp', 'pop', 'ns1', 'ns2', 'imap', 'admin',
+    'api', 'api2', 'api-dev', 'api-staging', 'dev', 'dev2', 'staging', 'stage', 'test',
+    'beta', 'portal', 'shop', 'secure', 'vpn', 'remote', 'blog', 'forum', 'cdn',
+    'cdn1', 'cdn2', 'static', 'media', 'assets', 'img', 'images', 'video', 'app',
+    'apps', 'mobile', 'm', 'store', 'support', 'help', 'wiki', 'docs', 'status',
+    'panel', 'cpanel', 'webdisk', 'autodiscover', 'autoconfig', 'owa', 'exchange',
+    'email', 'relay', 'mx', 'mx1', 'mx2', 'news', 'tv', 'radio', 'chat', 'sip',
+    'proxy', 'gateway', 'monitor', 'jenkins', 'git', 'gitlab', 'svn', 'login',
+    'auth', 'admin-panel', 'dashboard', 'internal', 'intranet', 'sso', 'id', 'identity',
+    'oauth', 'graphql', 'grpc', 'files', 'download', 'uploads', 'upload', 'storage',
+    'bucket', 'objects', 'static1', 'edge', 'lb', 'gw', 'origin', 'cache', 'search',
+    'maps', 'newsroom', 'payments', 'billing', 'checkout', 'account', 'accounts',
+    'profile', 'user', 'users', 'community', 'forum2', 'developer', 'developers',
+    'partners', 'sandbox', 'demo', 'uat', 'preprod', 'prod', 'origin-www', 'connect',
+    'events', 'data', 'db', 'sql', 'mysql', 'postgres', 'redis', 'kibana', 'grafana',
+    'prometheus', 'metrics', 'logs', 'trace', 'tracing', 'health', 'ping', 'downloads',
+    'docs-api', 'api-internal', 'admin-api', 'mail2', 'smtp2', 'ns3', 'ns4'
+]
+
+DNS_RECORD_ENUM_TYPES = ['A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT', 'SRV']
+MAX_DISCOVERED_SUBDOMAINS = 500
+
+def normalize_subdomain_candidate(name: str, domain: str) -> Optional[str]:
+    if not name:
+        return None
+
+    candidate = str(name).strip().lower().rstrip('.')
+    if not candidate:
+        return None
+
+    if candidate.startswith('*.'):
+        candidate = candidate[2:]
+
+    if '@' in candidate:
+        candidate = candidate.split('@')[-1]
+
+    candidate = candidate.replace('https://', '').replace('http://', '').split('/')[0].strip()
+    if not candidate or candidate == domain:
+        return None
+
+    if not candidate.endswith(f".{domain}"):
+        return None
+
+    if '*' in candidate or ' ' in candidate:
+        return None
+
+    labels = candidate.split('.')
+    if any(not label for label in labels):
+        return None
+
+    return candidate
+
+def extract_subdomains_from_text(text: str, domain: str) -> set[str]:
+    matches = set()
+    if not text:
+        return matches
+
+    pattern = re.compile(rf"(?:[a-zA-Z0-9_-]+\.)+{re.escape(domain)}")
+    for raw_match in pattern.findall(text):
+        normalized = normalize_subdomain_candidate(raw_match, domain)
+        if normalized:
+            matches.add(normalized)
+    return matches
 
 def get_passive_subdomains_sync(domain: str):
     subdomains = set()
-    url = f"https://crt.sh/?q=%.{domain}&output=json"
+    headers = {"User-Agent": "Mozilla/5.0 (CyberGuard/1.0)"}
+
+    crt_queries = [
+        f"https://crt.sh/?q=%.{domain}&output=json",
+        f"https://crt.sh/?q={domain}&output=json"
+    ]
+    for url in crt_queries:
+        try:
+            response = requests.get(url, headers=headers, timeout=20, verify=False)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    for entry in data:
+                        for key in ("name_value", "common_name"):
+                            for raw_name in str(entry.get(key, "")).splitlines():
+                                normalized = normalize_subdomain_candidate(raw_name, domain)
+                                if normalized:
+                                    subdomains.add(normalized)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     try:
-        response = requests.get(url, timeout=15)
+        response = requests.get(
+            f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns",
+            headers=headers,
+            timeout=20,
+            verify=False
+        )
         if response.status_code == 200:
             try:
                 data = response.json()
-                for entry in data:
-                    names_raw = entry.get('name_value', '')
-                    names_list = names_raw.split('\n')
-                    for name in names_list:
-                        name = name.strip()
-                        if not name: continue
-                        if name.startswith('*.'): continue
-                        if name.endswith(domain): subdomains.add(name)
-            except Exception: pass
-    except Exception: pass
-    return list(subdomains)
+                for entry in data.get("passive_dns", []):
+                    normalized = normalize_subdomain_candidate(entry.get("hostname", ""), domain)
+                    if normalized:
+                        subdomains.add(normalized)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        response = requests.get(
+            f"https://api.hackertarget.com/hostsearch/?q={domain}",
+            headers=headers,
+            timeout=20,
+            verify=False
+        )
+        if response.status_code == 200:
+            for line in response.text.splitlines():
+                host = line.split(",")[0].strip()
+                normalized = normalize_subdomain_candidate(host, domain)
+                if normalized:
+                    subdomains.add(normalized)
+    except Exception:
+        pass
+
+    try:
+        response = requests.get(
+            f"https://rapiddns.io/subdomain/{domain}?full=1",
+            headers=headers,
+            timeout=20,
+            verify=False
+        )
+        if response.status_code == 200:
+            subdomains.update(extract_subdomains_from_text(response.text, domain))
+    except Exception:
+        pass
+
+    return sorted(subdomains)
+
+def get_dns_record_subdomains_sync(domain: str):
+    discovered = set()
+    resolver = dns.resolver.Resolver()
+    resolver.lifetime = 5
+    resolver.timeout = 5
+
+    for record_type in DNS_RECORD_ENUM_TYPES:
+        try:
+            answers = resolver.resolve(domain, record_type)
+            for answer in answers:
+                discovered.update(extract_subdomains_from_text(str(answer), domain))
+        except Exception:
+            pass
+
+    return discovered
+
+def resolve_existing_subdomain(candidate: str) -> Optional[str]:
+    try:
+        socket.getaddrinfo(candidate, None)
+        return candidate
+    except socket.gaierror:
+        return None
+    except Exception:
+        return None
+
+def get_active_subdomains_sync(domain: str, seeds: List[str]):
+    candidates = set(f"{sub}.{domain}" for sub in COMMON_SUBDOMAIN_LIST)
+
+    for seed in seeds:
+        if not seed.endswith(f".{domain}"):
+            continue
+        prefix = seed[:-(len(domain) + 1)]
+        if not prefix:
+            continue
+        candidates.add(seed)
+        for common in ('dev', 'test', 'staging', 'api', 'admin', 'cdn', 'img', 'static', 'm'):
+            candidates.add(f"{common}.{seed}")
+            candidates.add(f"{prefix}-{common}.{domain}")
+            candidates.add(f"{common}-{prefix}.{domain}")
+
+    discovered = set()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
+        for result in pool.map(resolve_existing_subdomain, sorted(candidates)):
+            if result:
+                discovered.add(result)
+                if len(discovered) >= MAX_DISCOVERED_SUBDOMAINS:
+                    break
+
+    return discovered
+
+def discover_subdomains_sync(domain: str):
+    passive_subs = set(get_passive_subdomains_sync(domain))
+    dns_subs = get_dns_record_subdomains_sync(domain)
+    seed_subs = passive_subs | dns_subs
+    active_subs = get_active_subdomains_sync(domain, list(seed_subs))
+    all_subs = sorted((seed_subs | active_subs))[:MAX_DISCOVERED_SUBDOMAINS]
+    return all_subs
 
 # ================= WEBSITE MONITORING ROUTES =================
 @app.post("/start")
 async def start_monitoring(request: StartRequest, background_tasks: BackgroundTasks, current_user: User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
     if state.is_monitoring: raise HTTPException(status_code=400, detail="Already monitoring")
     parsed = urlparse(request.url)
-    domain = parsed.netloc
+    domain = (parsed.hostname or parsed.netloc).lower()
     scheme = parsed.scheme
     loop = asyncio.get_event_loop()
-    passive_subs = await loop.run_in_executor(None, get_passive_subdomains_sync, domain)
-    active_subs = []
-    for sub in SAFE_SUBDOMAIN_LIST:
-        full_domain = f"{sub}.{domain}"
-        try:
-            await loop.run_in_executor(None, socket.gethostbyname, full_domain)
-            active_subs.append(f"{scheme}://{full_domain}")
-        except socket.gaierror: pass
+    discovered_subs = await loop.run_in_executor(None, discover_subdomains_sync, domain)
     sub_urls = set()
     sub_urls.add(request.url)
-    for sub in passive_subs: sub_urls.add(f"{scheme}://{sub}")
-    sub_urls.update(active_subs)
+    for sub in discovered_subs:
+        sub_urls.add(f"{scheme}://{sub}")
     state.targets = list(sub_urls)
     state.is_monitoring = True
     state.target_url = request.url

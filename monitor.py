@@ -24,7 +24,8 @@ from database import SessionLocal
 from models import MonitorModelState
 
 # --- NEW IMPORTS FOR MONITOR LOGGING ---
-from models import Monitor, MonitorLog
+# FIX: Added Incident to this import line
+from models import Monitor, MonitorLog, Incident 
 from datetime import datetime
 from urllib.parse import urlparse # ADDED IMPORT
 
@@ -127,8 +128,87 @@ def save_monitor_log_entry(target_url: str, status_code: int, response_time: flo
         db.rollback()
     finally:
         db.close()
-# =======================================================
 
+# monitor.py - Replace handle_incident_tracking()
+
+def handle_incident_tracking(target_url: str, current_status: str, is_down: bool):
+    """
+    Creates or resolves Incident records based on state transitions.
+    """
+    db = SessionLocal()
+    try:
+        # Extract domain from URL
+        clean_domain = target_url.replace("https://", "").replace("http://", "").split("/")[0]
+
+        # Determine error type
+        error_type = "Unknown"
+        status_upper = current_status.upper()
+        
+        if "TIMEOUT" in status_upper:
+            error_type = "Timeout"
+        elif "CONNECTION REFUSED" in status_upper:
+            error_type = "Connection Refused"
+        elif "SERVER DOWN" in status_upper or "500" in status_upper:
+            error_type = "Server Error (5xx)"
+        elif "PROTECTED" in status_upper or "AUTH REQUIRED" in status_upper:
+            error_type = "Protected Resource"
+        elif "CLIENT ERROR" in status_upper or "404" in status_upper:
+            error_type = "Client Error (4xx)"
+        elif "CRITICAL" in status_upper or "PATTERN BREAKDOWN" in status_upper:
+            error_type = "Critical ML Anomaly"
+        elif "WARNING" in status_upper or "ANOMALY" in status_upper:
+            error_type = "Performance Warning"
+
+        # Find or create Monitor record
+        monitor = db.query(Monitor).filter(Monitor.target_url == target_url).first()
+        if not monitor:
+            # AUTO-CREATE Monitor if it doesn't exist
+            monitor = Monitor(
+                target_url=target_url,
+                user_id=1,  # Default user
+                is_active=True
+            )
+            db.add(monitor)
+            db.commit()
+            db.refresh(monitor)
+            print(f"[MONITOR] Auto-created monitor record for {clean_domain}")
+
+        # Check for existing ONGOING incident
+        ongoing_incident = db.query(Incident).filter(
+            Incident.monitor_id == monitor.id,
+            Incident.status == "Ongoing"
+        ).order_by(Incident.started_at.desc()).first()
+
+        # Handle DOWN transition
+        if is_down:
+            if not ongoing_incident:
+                new_incident = Incident(
+                    monitor_id=monitor.id,
+                    domain=clean_domain,
+                    status="Ongoing",
+                    error_type=error_type,
+                    started_at=datetime.utcnow()
+                )
+                db.add(new_incident)
+                db.commit()
+                print(f"[INCIDENT] OPENED for {clean_domain}: {error_type}")
+
+        # Handle UP transition
+        else:
+            if ongoing_incident:
+                now = datetime.utcnow()
+                ongoing_incident.status = "Resolved"
+                ongoing_incident.ended_at = now
+                duration = (now - ongoing_incident.started_at).total_seconds()
+                ongoing_incident.duration_seconds = int(duration)
+                db.commit()
+                print(f"[INCIDENT] RESOLVED for {clean_domain}: Duration={int(duration)}s")
+
+    except Exception as e:
+        print(f"[ERROR] Incident tracking failed for {target_url}: {e}")
+        db.rollback()
+    finally:
+        db.close()
 
 # --- 1. SMART DETECTOR (EWMA) ---
 # Logic taken from your requested snippet
@@ -191,22 +271,29 @@ class SmartDetector:
         else:
             self.consecutive_anomalies = 0
             return "UP", False
-
+# ============================================
+# FIXED: MultiFeatureIsolationForest
+# ============================================
 class MultiFeatureIsolationForest:
     def __init__(self, contamination=0.05):
         self.model = IsolationForest(contamination=contamination, random_state=42, n_estimators=100)
-        self.data = []
+        self.data = []           # CLEAN DATA ONLY
+        self.all_data_count = 0  # Track total checks (including dirty)
         self.is_trained = False
-        self.training_size = 100 
+        self.training_size = 100
         self.max_window = 200
         self.consecutive_anomalies = 0
-        self.required_consecutive = 3 
+        self.required_consecutive = 3
+        self.first_clean_data_time = None  # Track when we started collecting clean data
+        self.max_wait_seconds = 600        # Force train after 10 min of clean data collection
         
     def to_state_dict(self):
         return {
             "is_trained": self.is_trained,
             "consecutive_anomalies": self.consecutive_anomalies,
-            "required_consecutive": self.required_consecutive
+            "required_consecutive": self.required_consecutive,
+            "all_data_count": self.all_data_count,
+            "first_clean_data_time": self.first_clean_data_time
         }
 
     def get_model_blob(self):
@@ -219,54 +306,130 @@ class MultiFeatureIsolationForest:
     def load_state_dict(self, data):
         self.consecutive_anomalies = data.get("consecutive_anomalies", 0)
         self.required_consecutive = data.get("required_consecutive", 3)
+        self.all_data_count = data.get("all_data_count", 0)
+        self.first_clean_data_time = data.get("first_clean_data_time", None)
 
-    def update(self, features: list, allow_learning=True): # <--- MODIFIED SIGNATURE
-        self.data.append(features)
-        if len(self.data) > self.max_window: self.data.pop(0)
-        if len(self.data) < self.training_size: return "TRAINING", False
-
-        # --- GUARDED TRAINING LOGIC ---
-        # Only retrain periodically AND if system is stable
-        should_train = (not self.is_trained) or (len(self.data) % 50 == 0)
+    def _is_clean_sample(self, features: list) -> bool:
+        """
+        Validate that this data point is "clean" enough for training.
+        Rejects: timeouts, errors, extreme outliers, zero values
+        """
+        latency = features[0]
+        status_code = features[1]
         
-        if should_train:
-            if allow_learning:
+        # Reject non-successful HTTP responses
+        if status_code < 200 or status_code >= 400:
+            return False
+        
+        # Reject zero or negative latency (indicates failed request)
+        if latency <= 0:
+            return False
+        
+        # Reject extreme outliers (> 10 seconds is likely an error, not real latency)
+        if latency > 10000:
+            return False
+        
+        return True
+
+    def _should_force_train(self) -> bool:
+        """
+        Safety valve: If we've been collecting clean data for too long without
+        meeting training requirements, force train to prevent deadlock.
+        """
+        if self.first_clean_data_time is None:
+            return False
+        
+        elapsed = time.time() - self.first_clean_data_time
+        return elapsed > self.max_wait_seconds
+
+    def update(self, features: list, allow_learning=True):
+        self.all_data_count += 1
+        
+        # ============================================
+        # STEP 1: Clean data gate
+        # ============================================
+        is_clean = self._is_clean_sample(features)
+        
+        if is_clean:
+            # Track when we started getting clean data
+            if self.first_clean_data_time is None:
+                self.first_clean_data_time = time.time()
+            
+            self.data.append(features)
+            if len(self.data) > self.max_window:
+                self.data.pop(0)
+        else:
+            # Dirty data - reset clean timer (environment might be unstable)
+            self.first_clean_data_time = None
+            # Don't add to training buffer, but still run detection if trained
+            
+        # ============================================
+        # STEP 2: Detection (always run if trained)
+        # ============================================
+        if self.is_trained:
+            try:
+                prediction = self.model.predict([features])
+                if prediction[0] == -1:
+                    self.consecutive_anomalies += 1
+                    if self.consecutive_anomalies >= self.required_consecutive:
+                        return "ANOMALY: Multi-Feature Detected", True
+                    else:
+                        return "Unstable Pattern", False
+                else:
+                    self.consecutive_anomalies = 0
+                    return "NORMAL", False
+            except:
+                return "ERROR", False
+        
+        # ============================================
+        # STEP 3: Training logic (only if not trained)
+        # ============================================
+        if not self.is_trained:
+            clean_count = len(self.data)
+            
+            if clean_count < self.training_size:
+                return f"TRAINING: Collecting clean data ({clean_count}/{self.training_size})", False
+            
+            # We have enough clean data - check if we should train
+            force_train = self._should_force_train()
+            
+            if allow_learning or force_train:
                 try:
                     self.model.fit(self.data)
                     self.is_trained = True
-                except: return "ERROR", False
+                    mode = "forced" if force_train else "normal"
+                    print(f"[ISOFOREST] {mode} training complete with {clean_count} clean samples")
+                    return "TRAINED", False
+                except Exception as e:
+                    print(f"[ISOFOREST] Training error: {e}")
+                    return "ERROR", False
             else:
-                # Skip training to avoid learning bad patterns, but keep data in window
-                return "PAUSED LEARNING: Unstable", False
+                return "TRAINING: Waiting for stable environment", False
+        
+        return "TRAINING...", False
 
-        try:
-            prediction = self.model.predict([features])
-            if prediction[0] == -1:
-                self.consecutive_anomalies += 1
-                if self.consecutive_anomalies >= self.required_consecutive:
-                    return "ANOMALY: Multi-Feature Detected", True
-                else:
-                    return "Unstable Pattern", False
-            else:
-                self.consecutive_anomalies = 0
-                return "NORMAL", False
-        except:
-            return "ERROR", False
 
+# ============================================
+# FIXED: LSTMAutoencoderDetector  
+# ============================================
 class LSTMAutoencoderDetector:
-    def __init__(self, target_name, timesteps=30, training_size=500, threshold_percentile=95.0):
+    def __init__(self, target_name, timesteps=30, training_size=200, threshold_percentile=95.0):
         self.target_name = target_name.replace("/", "_").replace(":", "_")
         self.timesteps = timesteps
         self.training_size = training_size
         self.threshold_percentile = threshold_percentile
         
-        self.data = []
+        self.data = []           # CLEAN DATA ONLY
+        self.all_data_count = 0  # Track total checks
         self.scaler = MinMaxScaler()
         self.model = None
         self.is_trained = False
         self.threshold = 0.0 
         self.consecutive_anomalies = 0
-        self.required_consecutive = 2 
+        self.required_consecutive = 2
+        
+        self.first_clean_data_time = None
+        self.max_wait_seconds = 900  # 15 min for LSTM (needs more data)
 
         self.load_model()
 
@@ -290,14 +453,38 @@ class LSTMAutoencoderDetector:
             output.append(values[i : (i + self.timesteps)])
         return np.expand_dims(output, axis=2)
 
+    def _is_clean_sample(self, latency: float) -> bool:
+        """
+        Validate latency value is clean enough for training.
+        """
+        # Reject zero/negative (failed requests)
+        if latency <= 0:
+            return False
+        
+        # Reject extreme values (> 10 seconds)
+        if latency > 10000:
+            return False
+        
+        return True
+
+    def _should_force_train(self) -> bool:
+        """Safety valve to prevent infinite waiting"""
+        if self.first_clean_data_time is None:
+            return False
+        elapsed = time.time() - self.first_clean_data_time
+        return elapsed > self.max_wait_seconds
+
     def train(self):
-        if len(self.data) < self.training_size: return "COLLECTING_DATA", False
+        if len(self.data) < self.training_size:
+            return "COLLECTING_DATA", False
 
         data_arr = np.array(self.data).reshape(-1, 1)
         self.scaler.fit(data_arr)
         scaled_data = self.scaler.transform(data_arr)
         X = self._create_sequences(scaled_data)
-        if self.model is None: self.model = self._create_model()
+        
+        if self.model is None:
+            self.model = self._create_model()
 
         self.model.fit(X, X, epochs=20, batch_size=32, validation_split=0.1, verbose=0,
                       callbacks=[tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=3, mode='min')])
@@ -307,6 +494,7 @@ class LSTMAutoencoderDetector:
         self.threshold = np.percentile(train_mae_loss, self.threshold_percentile)
         self.is_trained = True
         self.save_model()
+        print(f"[LSTM] Training complete for {self.target_name}, threshold={self.threshold:.4f}")
         return "TRAINED", False
 
     def save_model(self):
@@ -319,7 +507,7 @@ class LSTMAutoencoderDetector:
             joblib.dump({
                 'threshold': self.threshold,
                 'scaler': self.scaler,
-                'data': self.data[-2000:] 
+                'data': self.data[-2000:]
             }, meta_path)
         except Exception as e:
             print(f"[ERROR] Failed to save model: {e}")
@@ -336,35 +524,43 @@ class LSTMAutoencoderDetector:
                 self.scaler = meta['scaler']
                 self.data = meta['data']
                 self.is_trained = True
+                print(f"[LSTM] Loaded existing model for {self.target_name}")
                 return True
         except Exception as e:
             print(f"[ERROR] Failed to load model: {e}")
-            return False
         return False
 
-    def update(self, new_value, allow_learning=True): # <--- MODIFIED SIGNATURE
-        if new_value <= 0: return "SKIPPED", False
-        self.data.append(new_value)
-        if len(self.data) > 2000: self.data = self.data[-2000:]
-
-        if len(self.data) < self.training_size: 
-            if not self.is_trained:
-                # Only collect data, don't train yet
-                return "LEARNING: Collecting Patterns", False
-            else:
-                return "RECOVERING: Buffering Data", False
-
-        # --- GUARDED TRAINING LOGIC ---
-        if not self.is_trained:
-            # Only train if allowed (i.e., SmartDetector says system is stable)
-            if allow_learning:
-                status, _ = self.train()
-                if status == "TRAINED": return status, False
-            else:
-                return "PAUSED LEARNING: Unstable Environment", False
-
+    def update(self, new_value, allow_learning=True):
+        self.all_data_count += 1
+        
+        # ============================================
+        # STEP 1: Clean data gate
+        # ============================================
+        is_clean = self._is_clean_sample(new_value)
+        
+        if is_clean:
+            if self.first_clean_data_time is None:
+                self.first_clean_data_time = time.time()
+            
+            self.data.append(new_value)
+            if len(self.data) > 2000:
+                self.data = self.data[-2000:]
+        else:
+            # Dirty data - reset clean timer
+            self.first_clean_data_time = None
+        
+        # ============================================
+        # STEP 2: Detection (always run if trained)
+        # ============================================
         if self.is_trained:
+            # For detection, we still need to check even dirty data
+            if new_value <= 0:
+                return "SKIPPED", False
+                
             recent_data = np.array(self.data[-self.timesteps:]).reshape(-1, 1)
+            if len(recent_data) < self.timesteps:
+                return "RECOVERING: Buffering Data", False
+                
             scaled_data = self.scaler.transform(recent_data)
             X_test = scaled_data.reshape(1, self.timesteps, 1)
             X_pred = self.model.predict(X_test, verbose=0)
@@ -385,6 +581,26 @@ class LSTMAutoencoderDetector:
             else:
                 self.consecutive_anomalies = 0
                 return "OPERATIONAL", False
+        
+        # ============================================
+        # STEP 3: Training logic (only if not trained)
+        # ============================================
+        if not self.is_trained:
+            clean_count = len(self.data)
+            
+            if clean_count < self.training_size:
+                return f"LEARNING: Collecting clean data ({clean_count}/{self.training_size})", False
+            
+            # Enough clean data - decide whether to train
+            force_train = self._should_force_train()
+            
+            if allow_learning or force_train:
+                status, _ = self.train()
+                if status == "TRAINED":
+                    return status, False
+            else:
+                return "LEARNING: Waiting for stable environment", False
+        
         return "TRAINING...", False
 
 # --- 4. MONITOR STATE ---
@@ -396,6 +612,10 @@ class MonitorState:
         self.targets: List[str] = [] 
         self.passive_targets: List[str] = [] 
         self.probe_id = "PROBE-001" 
+        
+        # --- ADDED: Incident transition tracking ---
+        self.previous_down_states: Dict[str, bool] = {}
+        
         # Detectors
         self.detectors: Dict[str, SmartDetector] = {}
         self.lstm_detectors: Dict[str, LSTMAutoencoderDetector] = {}
@@ -406,8 +626,69 @@ class MonitorState:
         self.baseline_avgs: Dict[str, float] = {}
         self.current_statuses: Dict[str, str] = {}
         self.http_status_codes: Dict[str, int] = {}
+        self.consecutive_probe_failures: Dict[str, int] = {}
+        self.last_known_status: Dict[str, str] = {}
+        self.last_known_latency: Dict[str, float] = {}
 
-# --- 5. HYBRID MONITORING LOOP (WITH GUARDED LEARNING) ---
+PROBE_FAILURE_THRESHOLD = 3
+ACTIVE_HTTP_TIMEOUT = httpx.Timeout(connect=8.0, read=15.0, write=10.0, pool=8.0)
+PASSIVE_HTTP_TIMEOUT = httpx.Timeout(connect=8.0, read=12.0, write=10.0, pool=8.0)
+
+async def probe_target(client: httpx.AsyncClient, target: str, headers: Dict[str, str]):
+    """
+    Probe a target with HEAD first, then fall back to GET for servers/CDNs
+    that reject or mishandle HEAD requests.
+    """
+    response = await client.head(target, headers=headers)
+
+    # Some sites block HEAD or return a misleading non-healthy status even
+    # though a normal GET request succeeds after redirects.
+    if response.status_code in {301, 302, 303, 307, 308, 403, 405}:
+        get_headers = dict(headers)
+        get_headers["Range"] = "bytes=0-0"
+        response = await client.get(target, headers=get_headers)
+
+    return response
+
+def classify_http_status(status_code: int) -> tuple[str, bool]:
+    """
+    Convert HTTP status codes into monitoring semantics.
+    Returns (status_message, is_up).
+    """
+    if status_code >= 500:
+        return f"SERVER DOWN ({status_code})", False
+
+    if status_code in {401, 403}:
+        return f"UP: Protected Resource ({status_code})", True
+
+    if status_code == 404:
+        return f"CLIENT ERROR ({status_code})", False
+
+    if 400 <= status_code < 500:
+        return f"CLIENT ERROR ({status_code})", False
+
+    return "Operational", True
+
+def register_probe_success(state: MonitorState, target: str, latency: float, status: str):
+    state.consecutive_probe_failures[target] = 0
+    state.last_known_status[target] = status
+    state.last_known_latency[target] = latency
+
+def classify_probe_exception(state: MonitorState, target: str, label: str) -> tuple[str, bool]:
+    """
+    A single failed probe should not immediately mark a healthy site as down.
+    Only escalate after repeated consecutive failures.
+    """
+    failures = state.consecutive_probe_failures.get(target, 0) + 1
+    state.consecutive_probe_failures[target] = failures
+
+    if failures < PROBE_FAILURE_THRESHOLD:
+        last_status = state.last_known_status.get(target, "Operational")
+        return f"Intermittent Probe Issue ({label})", True if last_status else True
+
+    return label, False
+
+# --- 5. HYBRID MONITORING LOOP (WITH GUARDED LEARNING & INCIDENT TRACKING) ---
 async def monitoring_loop(state: MonitorState):
     headers = {
         'User-Agent': 'Mozilla/5.0 (ServerPulse-AI/2.0; +https://serverpulse.ai)'
@@ -458,8 +739,8 @@ async def monitoring_loop(state: MonitorState):
 
             # --- 2. DATA COLLECTION & STABILITY CHECK ---
             try:
-                async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-                    response = await client.head(target, headers=headers)
+                async with httpx.AsyncClient(timeout=ACTIVE_HTTP_TIMEOUT, follow_redirects=True) as client:
+                    response = await probe_target(client, target, headers)
                 
                 current_latency = (time.time() - start_time) * 1000
                 state.http_status_codes[target] = response.status_code
@@ -472,14 +753,11 @@ async def monitoring_loop(state: MonitorState):
                 # However, AI can still DETECT the anomaly (we pass the data to update).
                 allow_ai_learning = not smart_anomaly
 
-                # Critical HTTP Errors bypass models
-                if response.status_code >= 500:
-                    state.current_statuses[target] = f"SERVER DOWN ({response.status_code})"
-                    update_history(state, target, 0)
-                    save_monitor_log_entry(target, response.status_code, 0, False)
-                
-                elif 400 <= response.status_code < 500:
-                    state.current_statuses[target] = f"CLIENT ERROR ({response.status_code})"
+                http_status, is_http_up = classify_http_status(response.status_code)
+
+                # Critical HTTP errors bypass models
+                if not is_http_up:
+                    state.current_statuses[target] = http_status
                     update_history(state, target, 0)
                     save_monitor_log_entry(target, response.status_code, 0, False)
 
@@ -494,7 +772,7 @@ async def monitoring_loop(state: MonitorState):
                     lstm_status, lstm_anomaly = state.lstm_detectors[target].update(current_latency, allow_learning=allow_ai_learning)
 
                     # --- 4. HYBRID DECISION LOGIC ---
-                    final_status = "Operational"
+                    final_status = http_status
                     is_critical = False
 
                     # If AI is paused learning because of instability, report it
@@ -525,19 +803,35 @@ async def monitoring_loop(state: MonitorState):
                     state.current_statuses[target] = final_status
                     update_history(state, target, current_latency)
                     save_monitor_log_entry(target, response.status_code, current_latency, True)
+                    register_probe_success(state, target, current_latency, final_status)
                     
-            except httpx.ConnectTimeout:
-                state.current_statuses[target] = "WARNING: Connection Timeout"
-                update_history(state, target, 0)
-                save_monitor_log_entry(target, None, 0, False) 
+            except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
+                timeout_status, is_timeout_up = classify_probe_exception(state, target, "WARNING: Connection Timeout")
+                state.current_statuses[target] = timeout_status
+                if is_timeout_up:
+                    update_history(state, target, state.last_known_latency.get(target, 0))
+                    save_monitor_log_entry(target, None, state.last_known_latency.get(target, 0), True)
+                else:
+                    update_history(state, target, 0)
+                    save_monitor_log_entry(target, None, 0, False)
             except httpx.ConnectError:
-                state.current_statuses[target] = "CONNECTION REFUSED"
-                update_history(state, target, 0)
-                save_monitor_log_entry(target, None, 0, False)
+                error_status, is_error_up = classify_probe_exception(state, target, "CONNECTION REFUSED")
+                state.current_statuses[target] = error_status
+                if is_error_up:
+                    update_history(state, target, state.last_known_latency.get(target, 0))
+                    save_monitor_log_entry(target, None, state.last_known_latency.get(target, 0), True)
+                else:
+                    update_history(state, target, 0)
+                    save_monitor_log_entry(target, None, 0, False)
             except Exception as e:
-                state.current_statuses[target] = f"ERROR: {str(e)[:20]}"
-                update_history(state, target, 0)
-                save_monitor_log_entry(target, None, 0, False)
+                error_status, is_error_up = classify_probe_exception(state, target, f"ERROR: {str(e)[:20]}")
+                state.current_statuses[target] = error_status
+                if is_error_up:
+                    update_history(state, target, state.last_known_latency.get(target, 0))
+                    save_monitor_log_entry(target, None, state.last_known_latency.get(target, 0), True)
+                else:
+                    update_history(state, target, 0)
+                    save_monitor_log_entry(target, None, 0, False)
 
             # --- 5. ALERTS ---
             check_service_alerts(target, state.current_statuses.get(target, "Unknown"), current_latency)
@@ -548,6 +842,34 @@ async def monitoring_loop(state: MonitorState):
                 save_detector_state(target, state.ml_detectors[target], "isolation_forest")
                 save_detector_state(target, state.lstm_detectors[target], "lstm_metadata")
                 last_save_time[target] = time.time()
+
+            # ============================================================
+            # --- 7. INCIDENT TRACKING (NEW) ---
+            # ============================================================
+            status_str = state.current_statuses.get(target, "").upper()
+            is_currently_down = (
+                "DOWN" in status_str or
+                "ERROR" in status_str or
+                "REFUSED" in status_str or
+                ("TIMEOUT" in status_str and "INTERMITTENT" not in status_str) or
+                "CRITICAL" in status_str or
+                "NOT FOUND" in status_str
+            )
+            
+            # Check previous state (default to UP if not tracked yet)
+            was_previously_down = state.previous_down_states.get(target, False)
+            
+            # Detect STATE TRANSITION
+            if is_currently_down and not was_previously_down:
+                # UP → DOWN transition: OPEN new incident
+                handle_incident_tracking(target, state.current_statuses.get(target, ""), True)
+            elif not is_currently_down and was_previously_down:
+                # DOWN → UP transition: RESOLVE existing incident
+                handle_incident_tracking(target, state.current_statuses.get(target, ""), False)
+            
+            # Update previous state for next iteration
+            state.previous_down_states[target] = is_currently_down
+            # ============================================================
 
         await asyncio.sleep(1.5) 
 
@@ -570,24 +892,19 @@ async def passive_monitoring_loop(state: MonitorState):
             current_status = "Unknown"
             
             try:
-                async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
-                    response = await client.head(target, headers=headers)
+                async with httpx.AsyncClient(timeout=PASSIVE_HTTP_TIMEOUT, follow_redirects=True) as client:
+                    response = await probe_target(client, target, headers)
                     
                 current_latency = (time.time() - start_time) * 1000
-                
-                if response.status_code >= 500:
-                    current_status = f"SERVER DOWN ({response.status_code})"
-                elif 400 <= response.status_code < 500:
-                    current_status = f"ERROR ({response.status_code})"
-                else:
-                    current_status = "Operational"
+                current_status, _ = classify_http_status(response.status_code)
+                register_probe_success(state, target, current_latency, current_status)
                     
-            except httpx.ConnectTimeout:
-                current_status = "WARNING: Connection Timeout"
+            except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout):
+                current_status, _ = classify_probe_exception(state, target, "WARNING: Connection Timeout")
             except httpx.ConnectError:
-                current_status = "CONNECTION REFUSED"
+                current_status, _ = classify_probe_exception(state, target, "CONNECTION REFUSED")
             except Exception as e:
-                current_status = f"ERROR: {str(e)[:20]}"
+                current_status, _ = classify_probe_exception(state, target, f"ERROR: {str(e)[:20]}")
 
             check_service_alerts(target, current_status, current_latency)
             
