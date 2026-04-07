@@ -32,7 +32,13 @@ from urllib.parse import urlparse # ADDED IMPORT
 
 # --- CONFIGURATION ---
 CRITICAL_LATENCY_LIMIT_MS = 5000.0
-SAVE_DIR = "saved_models"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SAVE_DIR = os.path.join(BASE_DIR, "saved_models")
+ISO_TRAINING_SIZE = 30
+LSTM_TIMESTEPS = 20
+LSTM_TRAINING_SIZE = 60
+
+os.makedirs(SAVE_DIR, exist_ok=True)
 
 # ================= PERSISTENCE HELPERS =================
 def save_detector_state(target_url, detector, detector_type):
@@ -109,9 +115,8 @@ def save_monitor_log_entry(target_url: str, status_code: int, response_time: flo
         
         # Only log if this URL is actually being tracked in the Monitor table
         if monitor:
-            # 2. Extract the domain from the target_url for the new column
-            # This strips 'http://' or 'https://' and removes any paths (e.g., /login)
-            clean_domain = target_url.replace("https://", "").replace("http://", "").split("/")[0]
+            # Persist the exact host being checked, including subdomains.
+            clean_domain = (urlparse(target_url).hostname or target_url).lower()
 
             log_entry = MonitorLog(
                 monitor_id=monitor.id,
@@ -137,8 +142,8 @@ def handle_incident_tracking(target_url: str, current_status: str, is_down: bool
     """
     db = SessionLocal()
     try:
-        # Extract domain from URL
-        clean_domain = target_url.replace("https://", "").replace("http://", "").split("/")[0]
+        # Persist the exact host that failed, including subdomains.
+        clean_domain = (urlparse(target_url).hostname or target_url).lower()
 
         # Determine error type
         error_type = "Unknown"
@@ -280,12 +285,12 @@ class MultiFeatureIsolationForest:
         self.data = []           # CLEAN DATA ONLY
         self.all_data_count = 0  # Track total checks (including dirty)
         self.is_trained = False
-        self.training_size = 100
+        self.training_size = ISO_TRAINING_SIZE
         self.max_window = 200
         self.consecutive_anomalies = 0
         self.required_consecutive = 3
         self.first_clean_data_time = None  # Track when we started collecting clean data
-        self.max_wait_seconds = 600        # Force train after 10 min of clean data collection
+        self.max_wait_seconds = 240        # Force train sooner so state does not stay untrained for long
         
     def to_state_dict(self):
         return {
@@ -413,10 +418,10 @@ class MultiFeatureIsolationForest:
 # FIXED: LSTMAutoencoderDetector  
 # ============================================
 class LSTMAutoencoderDetector:
-    def __init__(self, target_name, timesteps=30, training_size=200, threshold_percentile=95.0):
+    def __init__(self, target_name, timesteps=LSTM_TIMESTEPS, training_size=LSTM_TRAINING_SIZE, threshold_percentile=95.0):
         self.target_name = target_name.replace("/", "_").replace(":", "_")
         self.timesteps = timesteps
-        self.training_size = training_size
+        self.training_size = max(training_size, timesteps + 10)
         self.threshold_percentile = threshold_percentile
         
         self.data = []           # CLEAN DATA ONLY
@@ -429,7 +434,7 @@ class LSTMAutoencoderDetector:
         self.required_consecutive = 2
         
         self.first_clean_data_time = None
-        self.max_wait_seconds = 900  # 15 min for LSTM (needs more data)
+        self.max_wait_seconds = 360  # Keep DL learning practical for many monitored targets
 
         self.load_model()
 
@@ -482,6 +487,8 @@ class LSTMAutoencoderDetector:
         self.scaler.fit(data_arr)
         scaled_data = self.scaler.transform(data_arr)
         X = self._create_sequences(scaled_data)
+        if len(X) == 0:
+            return "COLLECTING_DATA", False
         
         if self.model is None:
             self.model = self._create_model()
@@ -499,8 +506,7 @@ class LSTMAutoencoderDetector:
 
     def save_model(self):
         try:
-            if not os.path.exists(SAVE_DIR):
-                os.makedirs(SAVE_DIR)
+            os.makedirs(SAVE_DIR, exist_ok=True)
             model_path = os.path.join(SAVE_DIR, f"lstm_{self.target_name}.h5")
             self.model.save(model_path)
             meta_path = os.path.join(SAVE_DIR, f"lstm_{self.target_name}_meta.pkl")
@@ -711,6 +717,8 @@ async def monitoring_loop(state: MonitorState):
                         detector.load_state_dict(data)
                     except Exception as e: print(f"[WARN] Corrupt smart state: {e}")
                 state.detectors[target] = detector
+                if not saved_state:
+                    save_detector_state(target, detector, "smart_detector")
 
             if target not in state.lstm_detectors:
                 saved_lstm = load_detector_state(target, "lstm_metadata")
@@ -722,6 +730,8 @@ async def monitoring_loop(state: MonitorState):
                         lstm.is_trained = meta.get("is_trained", False)
                     except: pass
                 state.lstm_detectors[target] = lstm
+                if not saved_lstm:
+                    save_detector_state(target, lstm, "lstm_metadata")
 
             if target not in state.ml_detectors:
                 saved_iso = load_detector_state(target, "isolation_forest")
@@ -733,6 +743,8 @@ async def monitoring_loop(state: MonitorState):
                             iso.load_state_dict(json.loads(saved_iso.parameters_json))
                     except: pass
                 state.ml_detectors[target] = iso
+                if not saved_iso:
+                    save_detector_state(target, iso, "isolation_forest")
 
             if target not in last_save_time:
                 last_save_time[target] = time.time()
@@ -804,6 +816,13 @@ async def monitoring_loop(state: MonitorState):
                     update_history(state, target, current_latency)
                     save_monitor_log_entry(target, response.status_code, current_latency, True)
                     register_probe_success(state, target, current_latency, final_status)
+
+                    # Persist trained state immediately instead of waiting for the next
+                    # periodic checkpoint so monitor_model_states reflects reality.
+                    if iso_status == "TRAINED":
+                        save_detector_state(target, state.ml_detectors[target], "isolation_forest")
+                    if lstm_status == "TRAINED":
+                        save_detector_state(target, state.lstm_detectors[target], "lstm_metadata")
                     
             except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
                 timeout_status, is_timeout_up = classify_probe_exception(state, target, "WARNING: Connection Timeout")

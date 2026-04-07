@@ -2353,6 +2353,7 @@ const MonitoringComponent = ({ onBack, token, username }) => {
   const [isLoading, setIsLoading] = useState(false);
   const [activeTab, setActiveTab] = useState("monitoring");
   const [searchTerm, setSearchTerm] = useState("");
+  const [incidentSearchTerm, setIncidentSearchTerm] = useState("");
   const [filterStatus, setFilterStatus] = useState("all");
   const [showFilterDropdown, setShowFilterDropdown] = useState(false);
   
@@ -2597,6 +2598,14 @@ const MonitoringComponent = ({ onBack, token, username }) => {
       if (filterStatus === "down") matchesFilter = down;
 
       return matchesSearch && matchesFilter;
+    });
+  };
+
+  const getIncidentTargets = () => {
+    return data.targets.filter((target) => {
+      const latency = data.current_latencies[target] || 0;
+      const status = data.status_messages[target] || data.current_statuses?.[target] || "";
+      return isTargetDown(status, latency);
     });
   };
 
@@ -2915,10 +2924,10 @@ const MonitoringComponent = ({ onBack, token, username }) => {
         </div>
       );
     } else if (activeTab === "incidents") {
-      const incidents = data.targets.filter(t => {
-           const latency = data.current_latencies[t] || 0;
-           return isTargetDown(data.status_messages[t], latency);
-      });
+      const incidents = getIncidentTargets();
+      const filteredIncidents = incidents.filter((target) =>
+        target.toLowerCase().includes(incidentSearchTerm.toLowerCase().trim())
+      );
 
       return (
         <div className="up-monitors-list">
@@ -2931,10 +2940,14 @@ const MonitoringComponent = ({ onBack, token, username }) => {
               <div className="up-widget" style={{marginBottom: "20px", borderLeft: "4px solid var(--status-red)"}}>
                 <h4 style={{color: "white", marginBottom: "5px"}}>Active Incidents</h4>
                 <p style={{fontSize: "0.9rem", color: "var(--text-muted)"}}>
-                  {incidents.length} monitor(s) are currently reporting issues.
+                  {filteredIncidents.length} of {incidents.length} monitor(s) currently reporting issues.
                 </p>
               </div>
-              {incidents.map((target) => {
+              {filteredIncidents.length === 0 ? (
+                <div className="up-empty-state up-empty-state-compact" style={{borderColor: "rgba(239, 68, 68, 0.35)"}}>
+                  <p>No active incidents match this search.</p>
+                </div>
+              ) : filteredIncidents.map((target) => {
                 const status = data.status_messages[target];
                 const latency = data.current_latencies[target] || 0;
                 const is404 = status && status.includes("NOT FOUND");
@@ -2995,7 +3008,7 @@ const MonitoringComponent = ({ onBack, token, username }) => {
           </div>
           <div 
             className={`nav-item ${activeTab === "incidents" ? "active" : ""}`}
-            onClick={() => setActiveTab("incidents")}
+            onClick={() => { setActiveTab("incidents"); setSelectedMonitor(null); }}
           >
             Incidents
           </div>
@@ -3079,6 +3092,18 @@ const MonitoringComponent = ({ onBack, token, username }) => {
                 </div>
               </>
             )}
+            {activeTab === "incidents" && !selectedMonitor && (
+              <div className="up-search-group">
+                <input
+                  type="text"
+                  placeholder="Search incident subdomain..."
+                  className="up-search up-search-incidents"
+                  value={incidentSearchTerm}
+                  onChange={(e) => setIncidentSearchTerm(e.target.value)}
+                  autoComplete="off"
+                />
+              </div>
+            )}
           </div>
         </header>
 
@@ -3125,15 +3150,15 @@ const MonitoringComponent = ({ onBack, token, username }) => {
             </div>
             <div className="stat-row">
               <span className="lbl">Incidents</span>
-              <span className="val">{data.targets.filter(t => isTargetDown(data.status_messages[t], data.current_latencies[t])).length}</span>
+              <span className="val">{getIncidentTargets().length}</span>
             </div>
             <div className="stat-row">
               <span className="lbl">Without incid.</span>
-              <span className="val">{data.targets.filter(t => isTargetDown(data.current_statuses[t], data.current_latencies[t])).length}</span>
+              <span className="val">{Math.max(0, data.targets.length - getIncidentTargets().length)}</span>
             </div>
             <div className="stat-row">
               <span className="lbl">Affected mon.</span>
-              <span className="val">{data.targets.filter(t => isTargetDown(data.status_messages[t], data.current_latencies[t])).length}</span>
+              <span className="val">{getIncidentTargets().length}</span>
             </div>
           </div>
           

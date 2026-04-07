@@ -630,11 +630,23 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .up-header h3 { margin: 0; font-size: 1.5rem; font-weight: 700; color: white; text-transform: uppercase; letter-spacing: 1px; }
 
 .up-actions { display: flex; gap: 12px; }
+.up-search-group { display: flex; align-items: center; }
 .up-search {
   background: rgba(0,0,0,0.3); border: 1px solid var(--border-color); color: white;
   padding: 8px 16px; width: 250px; font-size: 0.85rem; font-family: inherit; border-radius: 2px; transition: 0.3s;
 }
 .up-search:focus { border-color: var(--status-blue); outline: none; box-shadow: 0 0 10px rgba(6, 182, 212, 0.2); }
+.up-search-incidents {
+  width: 300px;
+  background: linear-gradient(180deg, rgba(17, 24, 39, 0.92), rgba(8, 14, 28, 0.88));
+  border-color: rgba(239, 68, 68, 0.22);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 0 0 1px rgba(239, 68, 68, 0.06);
+}
+.up-search-incidents::placeholder { color: rgba(148, 163, 184, 0.78); }
+.up-search-incidents:focus {
+  border-color: rgba(239, 68, 68, 0.55);
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.12), 0 0 18px rgba(239, 68, 68, 0.1);
+}
 
 .up-filter-btn {
   background: rgba(255,255,255,0.05); border: 1px solid var(--border-color);
@@ -652,6 +664,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   border: 1px dashed var(--border-color); border-radius: 4px; background: rgba(255,255,255,0.01);
   font-family: monospace;
 }
+.up-empty-state-compact { padding: 32px 20px; }
 
 /* Advanced Monitor Row Card */
 .up-monitor-row {
